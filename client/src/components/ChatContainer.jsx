@@ -13,6 +13,7 @@ import {
   Phone,
   Radio,
   Search,
+  Hash,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -87,9 +88,14 @@ const StatusIndicator = ({ isOnline, isTyping, lastSeen }) => {
 };
 
 const ChatContainer = () => {
-  const { messages, selectedUser, setSelectedUser, setMessages, sendMessage, getMessages, fetchMessages, emitTyping, typingUsers, editMessage, deleteMessage } =
-    useContext(ChatContext);
-  const { authUser, onlineUsers, lastSeen } = useContext(AuthContext);
+  const { 
+    messages, selectedUser, setSelectedUser, setMessages, 
+    sendMessage, sendGroupMessage, getMessages, getGroupMessages,
+    fetchMessages, fetchGroupMessages, emitTyping, typingUsers, groupTypingUsers,
+    editMessage, deleteMessage, chatType, setChatType,
+    joinGroup, leaveGroupSocket
+  } = useContext(ChatContext);
+  const { authUser, onlineUsers, lastSeen, socket } = useContext(AuthContext);
 
   const chatBoxRef = useRef();
   const scrollEnd = useRef();
@@ -127,7 +133,12 @@ const ChatContainer = () => {
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (input.trim() === "") return null;
-    await sendMessage({ text: input.trim() });
+    
+    if (chatType === "group") {
+      await sendGroupMessage({ text: input.trim() });
+    } else {
+      await sendMessage({ text: input.trim() });
+    }
     setInput("");
     emitTyping(false);
   };
@@ -143,7 +154,11 @@ const ChatContainer = () => {
     const reader = new FileReader();
 
     reader.onloadend = async () => {
-      await sendMessage({ image: reader.result });
+      if (chatType === "group") {
+        await sendGroupMessage({ image: reader.result });
+      } else {
+        await sendMessage({ image: reader.result });
+      }
       e.target.value = "";
     };
     reader.readAsDataURL(file);
@@ -157,7 +172,14 @@ const ChatContainer = () => {
       const previousScrollTop = container?.scrollTop;
 
       setIsLoadingMore(prepend);
-      const data = await fetchMessages(selectedUser._id, { page: pageNumber, limit: 20 });
+      
+      let data;
+      if (chatType === "group" && selectedUser?._id) {
+        data = await fetchGroupMessages(selectedUser._id, { page: pageNumber, limit: 20 });
+      } else if (selectedUser?._id) {
+        data = await fetchMessages(selectedUser._id, { page: pageNumber, limit: 20 });
+      }
+      
       if (data?.success) {
         if (prepend) {
           setMessages((prevMessages) => [...data.messages, ...prevMessages]);
@@ -180,16 +202,34 @@ const ChatContainer = () => {
     }
   };
 
-  useEffect(() => {
-    if (selectedUser) {
-      setPage(1);
-      setHasMore(false);
-      setSearchQuery("");
-      setCurrentMatchIndex(0);
-      setShowSearchPanel(false);
-      messageRefs.current = {};
-      loadMessagesPage(1);
+  const loadMessages = async () => {
+    if (!selectedUser || !selectedUser._id) return;
+    setPage(1);
+    setHasMore(false);
+    setSearchQuery("");
+    setCurrentMatchIndex(0);
+    setShowSearchPanel(false);
+    messageRefs.current = {};
+    
+    if (chatType === "group") {
+      joinGroup(selectedUser._id);
+      await getGroupMessages(selectedUser._id);
+    } else {
+      leaveGroupSocket(selectedUser._id);
+      await getMessages(selectedUser._id);
     }
+  };
+
+  useEffect(() => {
+    loadMessages();
+  }, [selectedUser, chatType]);
+
+  useEffect(() => {
+    return () => {
+      if (selectedUser && chatType === "group") {
+        leaveGroupSocket(selectedUser._id);
+      }
+    };
   }, [selectedUser]);
 
   useEffect(() => {
@@ -226,28 +266,72 @@ const ChatContainer = () => {
     }
   }, [activeSearch, hasSearch]);
 
-  return selectedUser ? (
+  const chatName = chatType === "group" ? (selectedUser?.name || "Group") : (selectedUser?.fullName || "Chat");
+  const chatAvatar = chatType === "group" 
+    ? (selectedUser?.groupPic || null) 
+    : selectedUser?.profilePic;
+  const participantCount = chatType === "group" 
+    ? selectedUser?.participants?.length || 0 
+    : null;
+  const isGroupAdmin = chatType === "group" && selectedUser?.admin?._id === authUser?._id;
+  const isGroupOnline = chatType === "group" || (selectedUser?._id && onlineUsers.includes(selectedUser._id));
+  const isTyping = chatType === "group" 
+    ? groupTypingUsers[selectedUser?._id] 
+    : (selectedUser?._id ? typingUsers[selectedUser._id] : false);
+
+  if (!selectedUser || !selectedUser._id) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full px-8">
+        <div className="size-24 rounded-full bg-teal-500/10 flex items-center justify-center mb-6">
+          <MessageCircleMore size={56} className="text-teal-500" />
+        </div>
+        <h2 className="text-2xl font-bold text-white mb-2">Welcome to ChatMate</h2>
+        <p className="text-gray-400 text-center">Select a chat or group to start messaging</p>
+      </div>
+    );
+  }
+
+  return (
     <div className="h-full overflow-scroll relative backdrop-blur-lg">
       {/* header  */}
       <div className="flex flex-col gap-3 py-2.5 px-2 bg-gray-900 md:px-5 border-b border-neutral-700">
         <div className="flex items-center justify-between">
           <div className="flex items-center justify-center gap-3 ">
             <ArrowLeft
-              onClick={() => setSelectedUser(null)}
+              onClick={() => {
+                setSelectedUser(null);
+                setChatType("direct");
+              }}
               className="md:hidden size-6 cursor-pointer text-gray-400 hover:text-white "
             />
-            <img
-              src={getAvatarUrl(selectedUser.profilePic)}
-              className="size-10 rounded-full object-cover"
-            />
+            {chatType === "group" ? (
+              <div className="size-10 rounded-full bg-teal-600 flex items-center justify-center">
+                {chatAvatar ? (
+                  <img src={chatAvatar} className="size-10 rounded-full object-cover" />
+                ) : (
+                  <span className="text-white font-bold text-lg">#</span>
+                )}
+              </div>
+            ) : (
+              <img
+                src={getAvatarUrl(selectedUser?.profilePic)}
+                className="size-10 rounded-full object-cover"
+              />
+            )}
 
             <div>
-              <p className="text-lg text-white font-medium">{selectedUser.fullName}</p>
-              <StatusIndicator 
-                isOnline={onlineUsers.includes(selectedUser._id)}
-                isTyping={typingUsers[selectedUser._id]}
-                lastSeen={lastSeen[selectedUser._id] ? formatLastSeen(lastSeen[selectedUser._id]) : null}
-              />
+              <p className="text-lg text-white font-medium">{chatName}</p>
+              {chatType === "group" ? (
+                <span className="text-xs text-teal-400">
+                  {participantCount} members
+                </span>
+              ) : selectedUser?._id ? (
+                <StatusIndicator 
+                  isOnline={selectedUser?._id && onlineUsers.includes(selectedUser._id)}
+                  isTyping={selectedUser?._id && typingUsers[selectedUser._id]}
+                  lastSeen={selectedUser?._id && lastSeen[selectedUser._id] ? formatLastSeen(lastSeen[selectedUser._id]) : null}
+                />
+              ) : null}
             </div>
           </div>
 
@@ -377,7 +461,10 @@ const ChatContainer = () => {
           </div>
         ) : null}
         {messages.map((msg, index) => {
-          const isMine = msg.senderId === authUser._id;
+          const senderIdStr = msg.senderId?._id || msg.senderId;
+          const isMine = senderIdStr === authUser._id;
+          const senderName = msg.senderId?.fullName || "Unknown";
+          const senderPic = msg.senderId?.profilePic;
           const statusColor =
             msg.status === "read"
               ? "text-teal-400"
@@ -545,11 +632,24 @@ const ChatContainer = () => {
 
               {!isMine && (
                 <div className="text-center text-xs">
-                  <img
-                    src={getAvatarUrl(selectedUser?.profilePic)}
-                    className="w-7 rounded-full object-cover"
-                  />
-                  <p className="text-gray-500">{formatMessageTime(msg.createdAt)}</p>
+                  {chatType === "group" ? (
+                    <>
+                      <img
+                        src={getAvatarUrl(senderPic)}
+                        className="w-7 rounded-full object-cover"
+                      />
+                      <p className="text-teal-400 text-[10px]">{senderName}</p>
+                      <p className="text-gray-500">{formatMessageTime(msg.createdAt)}</p>
+                    </>
+                  ) : (
+                    <>
+                      <img
+                        src={getAvatarUrl(selectedUser?.profilePic)}
+                        className="w-7 rounded-full object-cover"
+                      />
+                      <p className="text-gray-500">{formatMessageTime(msg.createdAt)}</p>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -593,34 +693,6 @@ const ChatContainer = () => {
         >
           <ArrowBigUp strokeWidth={2.5} />
         </button>
-      </div>
-    </div>
-  ) : (
-    <div className="flex flex-col items-center justify-center h-full  px-8">
-      <div className="size-24 rounded-full bg-teal-500/10 flex items-center justify-center mb-6">
-        <MessageCircleMore size={56} className="text-teal-500" />
-      </div>
-
-      <h2 className="text-2xl font-bold text-white mb-2">
-        Welcome to ChatMate
-      </h2>
-      <p className="text-gray-400 text-center mb-8">
-        Select a chat to start messaging
-      </p>
-
-      <div className="grid gap-4 max-w-md">
-        {features.map((feature, idx) => (
-          <div
-            key={feature.id}
-            className="flex items-center gap-4 p-4 bg-gray-800 rounded-lg"
-          >
-            <feature.icon className="size-7 text-teal-500 " />
-            <div>
-              <h3 className="text-white font-medium ">{feature.title}</h3>
-              <p className="text-sm text-gray-400">{feature.description}</p>
-            </div>
-          </div>
-        ))}
       </div>
     </div>
   );

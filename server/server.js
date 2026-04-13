@@ -5,6 +5,7 @@ import http from "http"
 import { connectDB } from "./lib/db.js";
 import router from "./routes/userRoutes.js";
 import messageRouter from "./routes/messageRoutes.js";
+import groupRouter from "./routes/groupRoutes.js";
 import { Server } from "socket.io";
 import Message from "./models/Message.model.js";
 import User from "./models/User.model.js";
@@ -39,6 +40,27 @@ io.on("connection", async (socket)=>{
 
     // broadcast status update
     io.emit("userStatusUpdate", { userId, status: "online" });
+
+    // Join group room
+    socket.on("joinGroup", ({ groupId }) => {
+        socket.join(`group:${groupId}`);
+        console.log(`User ${userId} joined group ${groupId}`);
+    });
+
+    // Leave group room
+    socket.on("leaveGroup", ({ groupId }) => {
+        socket.leave(`group:${groupId}`);
+        console.log(`User ${userId} left group ${groupId}`);
+    });
+
+    // Group typing indicator
+    socket.on('groupTyping', ({ groupId, userId: senderId, userName }) => {
+        socket.to(`group:${groupId}`).emit('groupUserTyping', { groupId, userId: senderId, userName });
+    });
+
+    socket.on('groupStopTyping', ({ groupId }) => {
+        socket.to(`group:${groupId}`).emit('groupUserStopTyping', { groupId });
+    });
 
     socket.on("disconnect", async ()=>{
         console.log("User Disconnected", userId);
@@ -123,6 +145,7 @@ app.use(cors());
 app.use("/api/status", (req, res)=> res.send("server is live"));
 app.use("/api/auth", router)
 app.use("/api/messages", messageRouter)
+app.use("/api/groups", groupRouter)
 
 // DB connect
 
