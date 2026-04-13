@@ -6,7 +6,6 @@ import { connectDB } from "./lib/db.js";
 import router from "./routes/userRoutes.js";
 import messageRouter from "./routes/messageRoutes.js";
 import groupRouter from "./routes/groupRoutes.js";
-import { Server } from "socket.io";
 import Message from "./models/Message.model.js";
 import User from "./models/User.model.js";
 
@@ -14,9 +13,8 @@ const app = express();
 const server = http.createServer(app)
 
 // initialize socket.io server
-export const io = new Server(server, {
-    cors: {origin: "*"}
-})
+import { initIO, getIO } from "./lib/socket.js";
+export const io = initIO(server);
 
 // store online users
 export const userSocketMap = {};   // {userId: socketId}

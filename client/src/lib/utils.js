@@ -6,6 +6,17 @@ export function formatMessageTime(date){
     })
 }
 
+export function formatFullDateTime(date){
+    return new Date(date).toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+    })
+}
+
 export function formatMessageDate(date) {
     const messageDate = new Date(date);
     const today = new Date();
