@@ -32,6 +32,14 @@ const messageSchema = new Schema({
     deleted: {
         type: Boolean,
         default: false
+    },
+    reactions: {
+        type: Map,
+        of: [{
+            userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+            emoji: String
+        }],
+        default: {}
     }
 
 }, {timestamps: true});

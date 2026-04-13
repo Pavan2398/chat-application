@@ -169,9 +169,9 @@ export const ChatProvider = ({ children }) => {
         `/api/groups/${selectedUser._id}/messages`,
         messageData
       );
-      if (data.success) {
-        setMessages((prevMessages) => [...prevMessages, data.newMessage]);
-      } else {
+      if (data.success && data.newMessage) {
+        setMessages((prev) => [...prev, data.newMessage]);
+      } else if (data.success === false) {
         toast.error(data.message);
       }
     } catch (error) {
@@ -269,18 +269,20 @@ export const ChatProvider = ({ children }) => {
       const isFromMe = newMessage.senderId === authUser._id || 
         newMessage.senderId?._id === authUser._id;
       
+      // Only add messages from OTHER people, not my own
       if (!isFromMe) {
-        const exists = messages.some(msg => msg._id === newMessage._id);
-        if (!exists) {
-          setMessages((prevMessages) => [...prevMessages, newMessage]);
+        setMessages((prevMessages) => {
+          const exists = prevMessages.some(msg => msg._id === newMessage._id);
+          if (exists) return prevMessages;
+          return [...prevMessages, newMessage];
+        });
+        
+        if (!isActiveGroup) {
+          setUnseenGroupMessages((prev) => ({
+            ...prev,
+            [newMessage.groupId]: (prev[newMessage.groupId] || 0) + 1
+          }));
         }
-      }
-      
-      if (!isActiveGroup && !isFromMe) {
-        setUnseenGroupMessages((prev) => ({
-          ...prev,
-          [newMessage.groupId]: (prev[newMessage.groupId] || 0) + 1
-        }));
       }
     });
 

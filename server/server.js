@@ -58,8 +58,8 @@ io.on("connection", async (socket)=>{
         socket.to(`group:${groupId}`).emit('groupUserTyping', { groupId, userId: senderId, userName });
     });
 
-    socket.on('groupStopTyping', ({ groupId }) => {
-        socket.to(`group:${groupId}`).emit('groupUserStopTyping', { groupId });
+    socket.on('groupStopTyping', ({ groupId, userId }) => {
+        socket.to(`group:${groupId}`).emit('groupUserStopTyping', { groupId, userId });
     });
 
     socket.on("disconnect", async ()=>{

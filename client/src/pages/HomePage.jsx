@@ -23,7 +23,7 @@ const HomePage = () => {
 
         {/* Desktop Layout */}
         <div
-          className={`hidden md:grid h-full ${
+          className={`hidden md:grid h-full overflow-hidden ${
             selectedUser
               ? "grid-cols-[360px_1fr_280px] xl:grid-cols-[400px_1fr_300px]"
               : "grid-cols-[360px_1fr] xl:grid-cols-[400px_1fr]"
