@@ -8,6 +8,7 @@ import messageRouter from "./routes/messageRoutes.js";
 import groupRouter from "./routes/groupRoutes.js";
 import Message from "./models/Message.model.js";
 import User from "./models/User.model.js";
+import jwt from "jsonwebtoken";
 
 const app = express();
 const server = http.createServer(app)
@@ -19,9 +20,37 @@ export const io = initIO(server);
 // store online users
 export const userSocketMap = {};   // {userId: socketId}
 
+// Socket authentication middleware
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token || 
+                  socket.handshake.query.token;
+    
+    if (!token) {
+        return next(new Error("Authentication required"));
+    }
+    
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        socket.user = decoded;
+        next();
+    } catch (err) {
+        console.log("Socket auth failed:", err.message);
+        if (err.name === 'TokenExpiredError') {
+            return next(new Error("Token expired"));
+        }
+        return next(new Error("Invalid token"));
+    }
+});
+
 // socket.io connection handler
 io.on("connection", async (socket)=>{
-    const userId = socket.handshake.query.userId;
+    const userId = socket.user?.userId || socket.handshake.query.userId;
+    
+    if (!userId) {
+        socket.disconnect();
+        return;
+    }
+    
     console.log("User Connected", userId);
 
     if(userId) {
@@ -109,6 +138,16 @@ io.on("connection", async (socket)=>{
                     messageIds: [updatedMessage._id],
                     status: "delivered",
                 });
+                
+                // Emit delivery ACK to sender
+                const senderSocketId = userSocketMap[updatedMessage.senderId.toString()];
+                if (senderSocketId) {
+                    io.to(senderSocketId).emit("messageAck", {
+                        clientMessageId: updatedMessage.clientMessageId,
+                        serverMessageId: updatedMessage._id,
+                        status: "delivered"
+                    });
+                }
             }
         } catch (error) {
             console.log(error.message);
@@ -127,9 +166,42 @@ io.on("connection", async (socket)=>{
                     messageIds: [updatedMessage._id],
                     status: "read",
                 });
+                
+                // Emit read ACK to sender
+                const senderSocketId = userSocketMap[updatedMessage.senderId.toString()];
+                if (senderSocketId) {
+                    io.to(senderSocketId).emit("messageAck", {
+                        clientMessageId: updatedMessage.clientMessageId,
+                        serverMessageId: updatedMessage._id,
+                        status: "read"
+                    });
+                }
             }
         } catch (error) {
             console.log(error.message);
+        }
+    });
+
+    // Sync missed messages on reconnect
+    socket.on("syncMessages", async ({ lastMessageId, lastMessageTimestamp }) => {
+        try {
+            const userIdStr = userId.toString();
+            const messages = await Message.find({
+                _id: { $gt: lastMessageId },
+                $or: [
+                    { senderId: userIdStr, receiverId: { $exists: true } },
+                    { receiverId: userIdStr, senderId: { $exists: true } }
+                ]
+            }).sort({ createdAt: 1 }).limit(100);
+
+            if (messages.length > 0) {
+                socket.emit("syncResponse", {
+                    messages,
+                    syncTimestamp: Date.now()
+                });
+            }
+        } catch (error) {
+            console.log("Sync error:", error.message);
         }
     });
     

@@ -1,9 +1,13 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState, useRef } from "react";
 import { AuthContext } from "./AuthContext";
 import { toast } from "sonner";
-import { getAvatarUrl } from "../src/lib/utils";
+import { v4 as uuidv4 } from "uuid";
 
 export const ChatContext = createContext();
+
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [2000, 4000, 8000];
+const PENDING_MESSAGES_KEY = 'chatmate_pending_messages';
 
 export const ChatProvider = ({ children }) => {
   const [messages, setMessages] = useState([]);
@@ -16,9 +20,132 @@ export const ChatProvider = ({ children }) => {
   const [loadingUsers, setLoadingUsers] = useState(true);
   const [typingUsers, setTypingUsers] = useState({});
   const [groupTypingUsers, setGroupTypingUsers] = useState({});
-
+  
+  const pendingMessagesRef = useRef({});
+  const retryTimeoutsRef = useRef({});
+  const isRetryingRef = useRef(false);
 
   const { socket, axios, authUser } = useContext(AuthContext);
+
+  const generateClientMessageId = () => {
+    return uuidv4();
+  };
+
+  // Persist pending messages to localStorage
+  const savePendingToStorage = () => {
+    try {
+      localStorage.setItem(PENDING_MESSAGES_KEY, JSON.stringify(pendingMessagesRef.current));
+    } catch (e) {
+      console.warn("Failed to save pending messages:", e);
+    }
+  };
+
+  const loadPendingFromStorage = () => {
+    try {
+      const stored = localStorage.getItem(PENDING_MESSAGES_KEY);
+      if (stored) {
+        pendingMessagesRef.current = JSON.parse(stored);
+      }
+    } catch (e) {
+      console.warn("Failed to load pending messages:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadPendingFromStorage();
+  }, []);
+
+  const addToPendingQueue = (message) => {
+    pendingMessagesRef.current[message.clientMessageId] = {
+      ...message,
+      retryCount: 0,
+      status: 'sending',
+      createdAt: Date.now()
+    };
+    savePendingToStorage();
+  };
+
+  const removeFromPendingQueue = (clientMessageId) => {
+    delete pendingMessagesRef.current[clientMessageId];
+    if (retryTimeoutsRef.current[clientMessageId]) {
+      clearTimeout(retryTimeoutsRef.current[clientMessageId]);
+      delete retryTimeoutsRef.current[clientMessageId];
+    }
+    savePendingToStorage();
+  };
+
+  const retryMessage = async (clientMessageId) => {
+    if (isRetryingRef.current) return;
+    
+    const pending = pendingMessagesRef.current[clientMessageId];
+    if (!pending) return;
+
+    if (pending.retryCount >= MAX_RETRIES) {
+      pending.status = 'failed';
+      savePendingToStorage();
+      toast.error("Message failed to send");
+      return;
+    }
+
+    isRetryingRef.current = true;
+    
+    pending.retryCount++;
+    pending.status = 'retrying';
+    savePendingToStorage();
+
+    const delay = RETRY_DELAYS[Math.min(pending.retryCount - 1, RETRY_DELAYS.length - 1)];
+    
+    retryTimeoutsRef.current[clientMessageId] = setTimeout(async () => {
+      try {
+        if (pending.isGroup) {
+          await axios.post(`/api/groups/${pending.groupId}/messages`, {
+            text: pending.text,
+            clientMessageId: pending.clientMessageId
+          });
+        } else {
+          await axios.post(`/api/messages/send/${pending.receiverId}`, {
+            text: pending.text,
+            clientMessageId: pending.clientMessageId
+          });
+        }
+      } catch (error) {
+        retryMessage(clientMessageId);
+      } finally {
+        isRetryingRef.current = false;
+      }
+    }, delay);
+  };
+
+  // Reconcile pending messages after reconnect
+  const reconcilePendingMessages = async () => {
+    const pending = pendingMessagesRef.current;
+    const clientMessageIds = Object.keys(pending);
+    
+    if (clientMessageIds.length === 0) return;
+
+    try {
+      const { data } = await axios.post('/api/messages/reconcile', {
+        clientMessageIds
+      });
+      
+      if (data.success && data.results) {
+        data.results.forEach(result => {
+          if (result.exists) {
+            removeFromPendingQueue(result.clientMessageId);
+            if (!result.isDuplicate) {
+              setMessages(prev => {
+                const exists = prev.some(m => m._id === result.serverMessageId);
+                if (exists) return prev;
+                return [...prev, result.message];
+              });
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.warn("Reconciliation failed:", error);
+    }
+  };
 
   // function to get all groups
   const getGroups = async () => {
@@ -87,19 +214,35 @@ export const ChatProvider = ({ children }) => {
   };
 
   //function to send message to selected user
-  const sendMessage = async (messageData) => {
+  const sendMessage = async (messageData, skipPending = false) => {
+    const clientMessageId = generateClientMessageId();
+    
+    if (!skipPending) {
+      addToPendingQueue({
+        clientMessageId,
+        text: messageData.text,
+        receiverId: selectedUser._id,
+        isGroup: false
+      });
+    }
+
     try {
       const { data } = await axios.post(
         `/api/messages/send/${selectedUser._id}`,
-        messageData
+        { ...messageData, clientMessageId }
       );
       if (data.success) {
-        setMessages((prevMessages) => [...prevMessages, data.newMessage]);
+        removeFromPendingQueue(clientMessageId);
+        if (!data.isDuplicate) {
+          setMessages((prevMessages) => [...prevMessages, data.newMessage]);
+        }
       } else {
         toast.error(data.message);
+        retryMessage(clientMessageId);
       }
     } catch (error) {
       toast.error(error.message);
+      retryMessage(clientMessageId);
     }
   };
 
@@ -160,6 +303,15 @@ export const ChatProvider = ({ children }) => {
   };
 
   const sendGroupMessage = async (messageData) => {
+    const clientMessageId = generateClientMessageId();
+    
+    addToPendingQueue({
+      clientMessageId,
+      text: messageData.text,
+      groupId: selectedUser._id,
+      isGroup: true
+    });
+
     try {
       if (!selectedUser || chatType !== "group") {
         toast.error("Select a group to send message");
@@ -167,15 +319,20 @@ export const ChatProvider = ({ children }) => {
       }
       const { data } = await axios.post(
         `/api/groups/${selectedUser._id}/messages`,
-        messageData
+        { ...messageData, clientMessageId }
       );
       if (data.success && data.newMessage) {
-        setMessages((prev) => [...prev, data.newMessage]);
+        removeFromPendingQueue(clientMessageId);
+        if (!data.isDuplicate) {
+          setMessages((prev) => [...prev, data.newMessage]);
+        }
       } else if (data.success === false) {
         toast.error(data.message);
+        retryMessage(clientMessageId);
       }
     } catch (error) {
       toast.error(error.message);
+      retryMessage(clientMessageId);
     }
   };
 
@@ -196,6 +353,21 @@ export const ChatProvider = ({ children }) => {
   // function to subscribe to messages for selected user
   const subscribeToMessages = async () => {
     if (!socket) return;
+
+    socket.on("messageAck", (ack) => {
+      const { clientMessageId, serverMessageId, status, isGroup, groupId } = ack;
+      if (clientMessageId) {
+        removeFromPendingQueue(clientMessageId);
+        
+        setMessages((prev) => {
+          const exists = prev.some(msg => 
+            msg.clientMessageId === clientMessageId || msg._id === serverMessageId
+          );
+          if (exists) return prev;
+          return prev;
+        });
+      }
+    });
 
     socket.on("newMessage", (newMessage) => {
       const isActiveChat = selectedUser && newMessage.senderId === selectedUser._id;
@@ -300,6 +472,18 @@ export const ChatProvider = ({ children }) => {
         return { ...prev, [groupId]: groupTyping };
       });
     });
+
+    socket.on("syncResponse", ({ messages: syncMessages, syncTimestamp }) => {
+      if (!syncMessages || syncMessages.length === 0) return;
+      
+      setMessages((prev) => {
+        const existingIds = new Set(prev.map(m => m._id));
+        const newMessages = syncMessages.filter(m => !existingIds.has(m._id));
+        return [...prev, ...newMessages].sort((a, b) => 
+          new Date(a.createdAt) - new Date(b.createdAt)
+        );
+      });
+    });
   };
 
   const joinGroup = (groupId) => {
@@ -314,21 +498,68 @@ export const ChatProvider = ({ children }) => {
     }
   };
 
+  const syncMissedMessages = () => {
+    if (!socket || messages.length === 0) return;
+    
+    // Get oldest message for sync (not newest)
+    const oldestMessage = [...messages].sort((a, b) => 
+      new Date(a.createdAt) - new Date(b.createdAt)
+    )[0];
+    
+    if (!oldestMessage) return;
+    
+    socket.emit("syncMessages", { 
+      lastMessageId: oldestMessage._id,
+      lastMessageTimestamp: new Date(oldestMessage.createdAt).toISOString()
+    });
+  };
+
+  // Reconciliation on reconnect
+  const handleReconnect = () => {
+    syncMissedMessages();
+    reconcilePendingMessages();
+  };
+
   // function to unsubscribe from messages
   const unsubscribeFromMessages = () => {
     if (!socket) return;
+    socket.off("messageAck");
     socket.off("newMessage");
     socket.off("messageStatusUpdate");
     socket.off("messageUpdated");
     socket.off("messageDeleted");
     socket.off("userTyping");
     socket.off("userStopTyping");
+    socket.off("syncResponse");
   };
 
   useEffect(() => {
     subscribeToMessages();
     return () => unsubscribeFromMessages();
   }, [socket, selectedUser]);
+
+  // Sync missed messages on socket reconnect
+  useEffect(() => {
+    window.addEventListener('socketReconnected', handleReconnect);
+    return () => window.removeEventListener('socketReconnected', handleReconnect);
+  }, [socket, messages]);
+
+  // Clean up stale pending messages on load (older than 24h)
+  useEffect(() => {
+    const cleanupStaleMessages = () => {
+      const now = Date.now();
+      const staleThreshold = 24 * 60 * 60 * 1000; // 24 hours
+      const pending = pendingMessagesRef.current;
+      
+      Object.keys(pending).forEach(clientId => {
+        if (now - pending[clientId].createdAt > staleThreshold) {
+          removeFromPendingQueue(clientId);
+        }
+      });
+    };
+    
+    cleanupStaleMessages();
+  }, []);
 
   const value = {
     messages,
@@ -361,6 +592,9 @@ export const ChatProvider = ({ children }) => {
     joinGroup,
     leaveGroupSocket,
     leaveGroup,
+    syncMissedMessages,
+    reconcilePendingMessages,
+    handleReconnect,
   };
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 };

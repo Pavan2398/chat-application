@@ -130,7 +130,10 @@ export const AuthProvider = ({ children  })=>{
             socket.disconnect();
         }
 
+        const token = localStorage.getItem("token");
+        
         const newSocket = io(backendUrl, {
+            auth: { token },
             query: {
                 userId: userData._id,
             },
@@ -144,6 +147,8 @@ export const AuthProvider = ({ children  })=>{
         newSocket.on("connect", () => {
             reconnectAttempts.current = 0;
             console.log("Socket connected");
+            // Sync missed messages on reconnect
+            window.dispatchEvent(new CustomEvent('socketReconnected'));
         });
 
         newSocket.on("reconnection", (attemptNumber) => {

@@ -40,11 +40,17 @@ const messageSchema = new Schema({
             emoji: String
         }],
         default: {}
+    },
+    clientMessageId: {
+        type: String,
+        sparse: true
     }
 
 }, {timestamps: true});
 
+messageSchema.index({ clientMessageId: 1 }, { unique: true, sparse: true });
 messageSchema.index({ groupId: 1, createdAt: -1 });
+messageSchema.index({ senderId: 1, receiverId: 1, createdAt: -1 });
 
 const Message = mongoose.model("Message", messageSchema);
 

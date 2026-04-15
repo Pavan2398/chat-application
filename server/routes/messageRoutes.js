@@ -78,6 +78,35 @@ messageRouter.patch("/:id/react/remove", protectRoute, async (req, res) => {
     }
 });
 
+messageRouter.post("/reconcile", protectRoute, async (req, res) => {
+    try {
+        const { clientMessageIds } = req.body;
+        
+        if (!clientMessageIds || !Array.isArray(clientMessageIds)) {
+            return res.json({ success: false, message: "Invalid request" });
+        }
+        
+        const messages = await Message.find({ 
+            clientMessageId: { $in: clientMessageIds } 
+        }).populate("senderId", "_id fullName profilePic");
+        
+        const results = clientMessageIds.map(clientId => {
+            const msg = messages.find(m => m.clientMessageId === clientId);
+            return {
+                clientMessageId: clientId,
+                exists: !!msg,
+                serverMessageId: msg?._id,
+                message: msg,
+                isDuplicate: msg?.clientMessageId !== clientId
+            };
+        });
+        
+        res.json({ success: true, results });
+    } catch (error) {
+        res.json({ success: false, message: error.message });
+    }
+});
+
 
 export default messageRouter;
 

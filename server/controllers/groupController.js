@@ -113,7 +113,7 @@ export const getGroupMessages = async (req, res) => {
 export const sendGroupMessage = async (req, res) => {
     try {
         const { groupId } = req.params;
-        const { text, image } = req.body;
+        const { text, image, clientMessageId } = req.body;
         const senderId = req.user._id;
 
         const group = await ChatRoom.findById(groupId);
@@ -135,15 +135,42 @@ export const sendGroupMessage = async (req, res) => {
             imageUrl = uploadResponse.secure_url;
         }
 
-        const newMessage = await Message.create({
-            senderId,
-            text,
-            image: imageUrl,
-            groupId
-        });
+        let newMessage;
+        try {
+            newMessage = await Message.create({
+                senderId,
+                text,
+                image: imageUrl,
+                groupId,
+                clientMessageId: clientMessageId || null,
+                status: "sent"
+            });
+        } catch (createErr) {
+            if (createErr.code === 11000 && createErr.keyPattern?.clientMessageId) {
+                const existing = await Message.findOne({ clientMessageId });
+                return res.json({
+                    success: true,
+                    newMessage: existing,
+                    isDuplicate: true
+                });
+            }
+            throw createErr;
+        }
 
         const populatedMessage = await Message.findById(newMessage._id)
             .populate("senderId", "_id fullName profilePic");
+
+        // Emit ACK to sender via socket
+        const senderSocketId = userSocketMap[senderId.toString()];
+        if (senderSocketId) {
+            io.to(senderSocketId).emit("messageAck", {
+                clientMessageId,
+                serverMessageId: newMessage._id,
+                status: "sent",
+                isGroup: true,
+                groupId
+            });
+        }
 
         await ChatRoom.findByIdAndUpdate(groupId, {
             lastMessage: newMessage._id,

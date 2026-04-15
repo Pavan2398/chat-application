@@ -208,21 +208,53 @@ export const deleteMessage = async (req, res) => {
 // send message to selected user
 export const sendMessage = async (req, res)=>{
     try {
-        const {text, image} = req.body;
+        const {text, image, clientMessageId} = req.body;
         const receiverId = req.params.id;
         const senderId = req.user._id;
+
+        // Authorization: Check if receiver exists and is valid
+        const receiver = await User.findById(receiverId);
+        if (!receiver) {
+            return res.json({ success: false, message: "Receiver not found" });
+        }
 
         let imageUrl;
         if(image){
             const uploadResponse = await cloudinary.uploader.upload(image)
             imageUrl = uploadResponse.secure_url;
         }
-        const newMessage = await Message.create({
-            senderId,
-            receiverId,
-            text,
-            image: imageUrl
-        })
+
+        let newMessage;
+        try {
+            newMessage = await Message.create({
+                senderId,
+                receiverId,
+                text,
+                image: imageUrl,
+                clientMessageId: clientMessageId || null,
+                status: "sent"
+            });
+        } catch (createErr) {
+            if (createErr.code === 11000 && createErr.keyPattern?.clientMessageId) {
+                const existing = await Message.findOne({ clientMessageId });
+                return res.json({
+                    success: true,
+                    newMessage: existing,
+                    isDuplicate: true
+                });
+            }
+            throw createErr;
+        }
+
+        // Emit ACK to sender via socket
+        const senderSocketId = userSocketMap[senderId.toString()];
+        if (senderSocketId) {
+            io.to(senderSocketId).emit("messageAck", {
+                clientMessageId,
+                serverMessageId: newMessage._id,
+                status: "sent"
+            });
+        }
 
         // emit the new message to the receivers socket
         const receiverSocketId = userSocketMap[receiverId];
