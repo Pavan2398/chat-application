@@ -90,14 +90,17 @@ messageRouter.post("/reconcile", protectRoute, async (req, res) => {
             clientMessageId: { $in: clientMessageIds } 
         }).populate("senderId", "_id fullName profilePic");
         
+        // Server wins strategy: return server state for everything
         const results = clientMessageIds.map(clientId => {
             const msg = messages.find(m => m.clientMessageId === clientId);
             return {
                 clientMessageId: clientId,
                 exists: !!msg,
                 serverMessageId: msg?._id,
+                status: msg?.status,
                 message: msg,
-                isDuplicate: msg?.clientMessageId !== clientId
+                isDuplicate: msg?.clientMessageId !== clientId,
+                conflict: msg && msg.clientMessageId !== clientId
             };
         });
         

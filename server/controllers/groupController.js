@@ -1,14 +1,62 @@
 import ChatRoom from "../models/ChatRoom.model.js";
 import User from "../models/User.model.js";
-import { io, userSocketMap } from "../server.js";
+import { io } from "../lib/socket.js";
+import checkMessageRate from "../middleware/rateLimiter.js";
+
+// Helper function to sanitize input - prevents XSS attacks
+const sanitizeInput = (input) => {
+    if (typeof input !== 'string') return input;
+    
+    return input
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;')
+        .replace(/\//g, '&#x2F;')
+        .trim();
+};
+
+// Helper function to validate text (for messages and group names)
+const validateText = (text, maxLength = 1000, fieldName = "Text") => {
+    if (!text || typeof text !== 'string') {
+        return { valid: false, message: `${fieldName} is required` };
+    }
+    
+    const trimmed = text.trim();
+    
+    if (trimmed.length === 0) {
+        return { valid: false, message: `${fieldName} cannot be empty` };
+    }
+    
+    if (trimmed.length > maxLength) {
+        return { valid: false, message: `${fieldName} is too long (max ${maxLength} characters)` };
+    }
+    
+    // Check for potential malicious patterns
+    const suspiciousPatterns = [
+        /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi,
+        /javascript:/gi,
+        /on\w+\s*=/gi,
+    ];
+    
+    for (const pattern of suspiciousPatterns) {
+        if (pattern.test(trimmed)) {
+            return { valid: false, message: `${fieldName} contains invalid content` };
+        }
+    }
+    
+    return { valid: true, text: trimmed };
+};
 
 export const createGroup = async (req, res) => {
     try {
         const { name, groupPic, participantIds } = req.body;
         const adminId = req.user._id;
 
-        if (!name || !name.trim()) {
-            return res.json({ success: false, message: "Group name is required" });
+        // Validate group name
+        const nameValidation = validateText(name, 100, "Group name");
+        if (!nameValidation.valid) {
+            return res.json({ success: false, message: nameValidation.message });
         }
 
         if (!participantIds || participantIds.length < 2) {
@@ -18,7 +66,7 @@ export const createGroup = async (req, res) => {
         const uniqueParticipants = [...new Set([...participantIds, adminId.toString()])];
         
         const existingGroup = await ChatRoom.findOne({
-            name: name.trim(),
+            name: nameValidation.text,
             participants: { $all: uniqueParticipants.map(id => id) }
         });
 
@@ -26,9 +74,13 @@ export const createGroup = async (req, res) => {
             return res.json({ success: false, message: "Group with same name and participants already exists" });
         }
 
+        // Sanitize group name and groupPic
+        const sanitizedName = sanitizeInput(nameValidation.text);
+        const sanitizedGroupPic = groupPic ? sanitizeInput(groupPic) : "";
+
         const newGroup = await ChatRoom.create({
-            name: name.trim(),
-            groupPic: groupPic || "",
+            name: sanitizedName,
+            groupPic: sanitizedGroupPic,
             participants: uniqueParticipants,
             admin: adminId
         });
@@ -116,6 +168,24 @@ export const sendGroupMessage = async (req, res) => {
         const { text, image, clientMessageId } = req.body;
         const senderId = req.user._id;
 
+        // Validate message text
+        if (text) {
+            const textValidation = validateText(text, 10000, "Message");
+            if (!textValidation.valid) {
+                return res.json({ success: false, message: textValidation.message });
+            }
+        }
+
+        // Rate limiting check
+        const rateCheck = checkMessageRate(senderId.toString());
+        if (!rateCheck.allowed) {
+            return res.status(429).json({ 
+                success: false, 
+                message: "Rate limit exceeded",
+                retryAfter: rateCheck.retryAfter 
+            });
+        }
+
         const group = await ChatRoom.findById(groupId);
         
         if (!group) {
@@ -135,11 +205,14 @@ export const sendGroupMessage = async (req, res) => {
             imageUrl = uploadResponse.secure_url;
         }
 
+        // Sanitize text
+        const sanitizedText = text ? sanitizeInput(text) : null;
+
         let newMessage;
         try {
             newMessage = await Message.create({
                 senderId,
-                text,
+                text: sanitizedText,
                 image: imageUrl,
                 groupId,
                 clientMessageId: clientMessageId || null,
@@ -147,10 +220,9 @@ export const sendGroupMessage = async (req, res) => {
             });
         } catch (createErr) {
             if (createErr.code === 11000 && createErr.keyPattern?.clientMessageId) {
-                const existing = await Message.findOne({ clientMessageId });
                 return res.json({
                     success: true,
-                    newMessage: existing,
+                    clientMessageId,
                     isDuplicate: true
                 });
             }
@@ -160,17 +232,14 @@ export const sendGroupMessage = async (req, res) => {
         const populatedMessage = await Message.findById(newMessage._id)
             .populate("senderId", "_id fullName profilePic");
 
-        // Emit ACK to sender via socket
-        const senderSocketId = userSocketMap[senderId.toString()];
-        if (senderSocketId) {
-            io.to(senderSocketId).emit("messageAck", {
-                clientMessageId,
-                serverMessageId: newMessage._id,
-                status: "sent",
-                isGroup: true,
-                groupId
-            });
-        }
+        // Emit ACK to sender via user room (works across all servers)
+        io.to(`user:${senderId.toString()}`).emit("messageAck", {
+            clientMessageId,
+            serverMessageId: newMessage._id,
+            status: "sent",
+            isGroup: true,
+            groupId
+        });
 
         await ChatRoom.findByIdAndUpdate(groupId, {
             lastMessage: newMessage._id,
@@ -178,11 +247,9 @@ export const sendGroupMessage = async (req, res) => {
             lastMessageAt: new Date()
         });
 
+        // Emit to all participants' user rooms (multi-server support)
         group.participants.forEach(participantId => {
-            const socketId = userSocketMap[participantId];
-            if (socketId) {
-                io.to(socketId).emit("newGroupMessage", populatedMessage);
-            }
+            io.to(`user:${participantId}`).emit("newGroupMessage", populatedMessage);
         });
 
         res.json({ success: true, newMessage: populatedMessage });
@@ -195,24 +262,29 @@ export const sendGroupMessage = async (req, res) => {
 export const addParticipant = async (req, res) => {
     try {
         const { groupId } = req.params;
-        const { userId } = req.body;
+        const { userId, userIds } = req.body;
         const adminId = req.user._id;
 
         const group = await ChatRoom.findById(groupId);
         
         if (!group) {
-            return res.json({ success: false, message: "Group not found" });
+            return res.status(404).json({ success: false, message: "Group not found" });
         }
 
         if (group.admin.toString() !== adminId.toString()) {
-            return res.json({ success: false, message: "Only admin can add participants" });
+            return res.status(403).json({ success: false, message: "Only admin can add participants" });
         }
 
-        if (group.participants.includes(userId)) {
-            return res.json({ success: false, message: "User already in group" });
+        const idsToAdd = userIds || (userId ? [userId] : []);
+        
+        for (const id of idsToAdd) {
+            // Convert to string for comparison
+            const idStr = id.toString();
+            if (!group.participants.some(p => p.toString() === idStr)) {
+                group.participants.push(id);
+            }
         }
-
-        group.participants.push(userId);
+        
         await group.save();
 
         const updatedGroup = await ChatRoom.findById(groupId)
@@ -222,7 +294,7 @@ export const addParticipant = async (req, res) => {
         res.json({ success: true, group: updatedGroup });
     } catch (error) {
         console.log("Add participant error:", error.message);
-        res.json({ success: false, message: error.message });
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -235,15 +307,15 @@ export const removeParticipant = async (req, res) => {
         const group = await ChatRoom.findById(groupId);
         
         if (!group) {
-            return res.json({ success: false, message: "Group not found" });
+            return res.status(404).json({ success: false, message: "Group not found" });
         }
 
         if (group.admin.toString() !== adminId.toString()) {
-            return res.json({ success: false, message: "Only admin can remove participants" });
+            return res.status(403).json({ success: false, message: "Only admin can remove participants" });
         }
 
         if (userId === group.admin.toString()) {
-            return res.json({ success: false, message: "Cannot remove admin" });
+            return res.status(400).json({ success: false, message: "Cannot remove admin" });
         }
 
         group.participants = group.participants.filter(p => p.toString() !== userId);
@@ -256,7 +328,7 @@ export const removeParticipant = async (req, res) => {
         res.json({ success: true, group: updatedGroup });
     } catch (error) {
         console.log("Remove participant error:", error.message);
-        res.json({ success: false, message: error.message });
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -307,18 +379,27 @@ export const updateGroup = async (req, res) => {
         const { name, groupPic } = req.body;
         const adminId = req.user._id;
 
+        // Validate group name if provided
+        if (name) {
+            const nameValidation = validateText(name, 100, "Group name");
+            if (!nameValidation.valid) {
+                return res.json({ success: false, message: nameValidation.message });
+            }
+        }
+
         const group = await ChatRoom.findById(groupId);
         
         if (!group) {
-            return res.json({ success: false, message: "Group not found" });
+            return res.status(404).json({ success: false, message: "Group not found" });
         }
 
         if (group.admin.toString() !== adminId.toString()) {
-            return res.json({ success: false, message: "Only admin can update group" });
+            return res.status(403).json({ success: false, message: "Only admin can update group" });
         }
 
-        if (name) group.name = name.trim();
-        if (groupPic !== undefined) group.groupPic = groupPic;
+        // Sanitize inputs
+        if (name) group.name = sanitizeInput(name.trim());
+        if (groupPic !== undefined) group.groupPic = groupPic ? sanitizeInput(groupPic) : "";
         
         await group.save();
 
@@ -329,6 +410,6 @@ export const updateGroup = async (req, res) => {
         res.json({ success: true, group: updatedGroup });
     } catch (error) {
         console.log("Update group error:", error.message);
-        res.json({ success: false, message: error.message });
+        res.status(500).json({ success: false, message: error.message });
     }
 };

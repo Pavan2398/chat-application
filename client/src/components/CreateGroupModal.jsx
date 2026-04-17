@@ -58,7 +58,7 @@ const CreateGroupModal = ({ isOpen, onClose }) => {
         setSelectedParticipants([]);
         setGroupPic("");
       } else {
-        toast.error(data.message);
+        toast.error(data.message || "Failed to create group");
       }
     } catch (error) {
       toast.error(error.response?.data?.message || "Failed to create group");

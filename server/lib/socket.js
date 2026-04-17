@@ -6,6 +6,7 @@ export const initIO = (server) => {
     io = new Server(server, {
         cors: { origin: "*" }
     });
+
     return io;
 };
 

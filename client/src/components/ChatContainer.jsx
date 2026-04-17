@@ -364,7 +364,16 @@ const ChatContainer = () => {
           <div>
             <h3 className="text-sm font-semibold text-white">{isDirect ? selectedUser?.fullName : selectedUser?.name}</h3>
             {isDirect ? (
-              isUserOnline ? <span className="text-xs text-green-500">online</span> : <span className="text-xs text-gray-500">{userLastSeen || "offline"}</span>
+              isTyping ? (
+                <span className="text-xs text-blue-400 flex items-center gap-1">
+                  <span className="flex gap-0.5">
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                  </span>
+                  typing
+                </span>
+              ) : isUserOnline ? <span className="text-xs text-green-500">online</span> : <span className="text-xs text-gray-500">{userLastSeen || "offline"}</span>
             ) : (
               <span className="text-xs text-teal-500">{selectedUser?.participants?.length || 0} members</span>
             )}
@@ -409,12 +418,10 @@ const ChatContainer = () => {
       <div ref={chatBoxRef} onScroll={() => { const el = chatBoxRef.current; if (el && el.scrollTop <= 50 && !isLoadingMore && hasMore && !hasSearch) loadMessagesPage(page + 1, { prepend: true }); }} className="flex-1 overflow-y-auto overflow-x-hidden p-3 flex flex-col">
         {isLoadingMore && <div className="text-center text-xs uppercase tracking-[0.3em] text-gray-400 py-2">Loading earlier messages...</div>}
         
-        {/* Typing indicator at bottom of messages */}
-        {(otherTyping || groupTyping) && (
+        {/* Group typing indicator at bottom of messages - only for groups */}
+        {chatType === "group" && groupTyping && (
           <div className="flex items-center gap-2 px-2 py-1">
-            {isDirect && isTyping ? (
-              <div className="flex items-center gap-1"><TypingIndicator /><span className="text-xs text-blue-400">typing</span></div>
-            ) : <GroupTypingStatus groupTypingUsers={groupTypingUsers} groupId={selectedUserId} />}
+            <GroupTypingStatus groupTypingUsers={groupTypingUsers} groupId={selectedUserId} />
           </div>
         )}
 
@@ -427,7 +434,6 @@ const ChatContainer = () => {
           const isMine = senderIdStr === authUser._id;
           const senderName = msg.senderId?.fullName || "Unknown";
           const senderPic = msg.senderId?.profilePic;
-          const statusColor = msg.status === "read" ? "text-teal-400" : "text-gray-400";
           const msgId = msg._id?.toString() || index.toString();
           const isMatch = hasSearch && searchResults.some((r) => r.id === msgId);
           const isActiveMatch = hasSearch && activeSearch?.id === msgId;
@@ -570,7 +576,17 @@ const ChatContainer = () => {
 
                 {/* Time and status */}
                   <div className={`flex items-center gap-1 text-[10px] ${isMine ? "self-end" : "self-start"}`}>
-                    {isMine && <span className={statusColor}>{msg.status === "read" ? "✓✓" : "✓"}</span>}
+                    {isMine && (
+                      <>
+                        {msg.status === "read" ? (
+                          <span className="text-green-500">✓✓</span>
+                        ) : msg.status === "delivered" ? (
+                          <span className="text-gray-400">✓✓</span>
+                        ) : (
+                          <span className="text-gray-500">✓</span>
+                        )}
+                      </>
+                    )}
                     <span className="text-gray-500 group-hover:text-gray-400">{formatMessageTime(msg.createdAt)}</span>
                   </div>
                 </div>

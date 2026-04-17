@@ -13,12 +13,15 @@ import jwt from "jsonwebtoken";
 const app = express();
 const server = http.createServer(app)
 
-// initialize socket.io server
+// initialize socket.io server with Redis adapter for multi-server support
 import { initIO, getIO } from "./lib/socket.js";
-export const io = initIO(server);
+export const io = await initIO(server);
 
-// store online users
-export const userSocketMap = {};   // {userId: socketId}
+// Import rate limiter with backpressure
+import checkMessageRate, { checkEventRate, checkServerLoad } from "./middleware/rateLimiter.js";
+
+// Track online users in memory (for quick lookups)
+const onlineUsers = new Set();
 
 // Socket authentication middleware
 io.use((socket, next) => {
@@ -36,7 +39,7 @@ io.use((socket, next) => {
     } catch (err) {
         console.log("Socket auth failed:", err.message);
         if (err.name === 'TokenExpiredError') {
-            return next(new Error("Token expired"));
+            return next(new Error("TOKEN_EXPIRED"));
         }
         return next(new Error("Invalid token"));
     }
@@ -53,20 +56,23 @@ io.on("connection", async (socket)=>{
     
     console.log("User Connected", userId);
 
-    if(userId) {
-        userSocketMap[userId] = socket.id;
-        
-        await User.findByIdAndUpdate(userId, { 
-            status: "online",
-            lastSeen: new Date()
-        });
-    }
+    // Join user-specific room for multi-device/multi-server support
+    socket.join(`user:${userId}`);
+    onlineUsers.add(userId);
 
-    // emit online users to all connected clients
-    io.emit("getOnlineUsers", Object.keys(userSocketMap));
+    await User.findByIdAndUpdate(userId, { 
+        status: "online",
+        lastSeen: new Date()
+    });
 
-    // broadcast status update
+    // emit online users to all connected clients - broadcast to ALL
+    io.emit("getOnlineUsers", Array.from(onlineUsers));
+
+    // broadcast status update to everyone
     io.emit("userStatusUpdate", { userId, status: "online" });
+    
+    // Also emit to specific user rooms for better reliability
+    io.emit("userOnline", { userId });
 
     // Join group room
     socket.on("joinGroup", ({ groupId }) => {
@@ -94,61 +100,87 @@ io.on("connection", async (socket)=>{
         const lastSeen = new Date();
         
         if(userId) {
-            delete userSocketMap[userId];
+            onlineUsers.delete(userId);
             
             await User.findByIdAndUpdate(userId, { 
                 status: "offline",
                 lastSeen: lastSeen
             });
             
+            // Emit userStatusUpdate to all clients
             io.emit("userStatusUpdate", { 
                 userId, 
                 status: "offline",
                 lastSeen: lastSeen.toISOString()
             });
+            
+            // Also emit userOffline for redundancy
+            io.emit("userOffline", { 
+                userId, 
+                lastSeen: lastSeen.toISOString()
+            });
         }
         
-        io.emit("getOnlineUsers", Object.keys(userSocketMap));
+        // Broadcast updated online users list
+        io.emit("getOnlineUsers", Array.from(onlineUsers));
     })
 
-    // typing indicator events
+    // typing indicator events - with backpressure
     socket.on('typing', ({ from, to }) => {
-        const receiverSocketId = userSocketMap[to];
-        if (receiverSocketId) {
-            io.to(receiverSocketId).emit('userTyping', { from });
+        const loadCheck = checkServerLoad();
+        
+        // Drop typing indicators under high load
+        if (!loadCheck.allowed) {
+            return;
         }
+        
+        io.to(`user:${to}`).emit('userTyping', { from });
     });
 
     socket.on('stopTyping', ({ from, to }) => {
-        const receiverSocketId = userSocketMap[to];
-        if (receiverSocketId) {
-            io.to(receiverSocketId).emit('userStopTyping', { from });
+        const loadCheck = checkServerLoad();
+        
+        if (!loadCheck.allowed) {
+            return;
         }
+        
+        io.to(`user:${to}`).emit('userStopTyping', { from });
     });
 
     socket.on("messageDelivered", async ({ messageId, to }) => {
         try {
+            const message = await Message.findById(messageId);
+            if (!message) return;
+            
+            // Check if already delivered
+            if (message.deliveredTo && message.deliveredTo.includes(to)) {
+                return;
+            }
+            
+            // Update to delivered
             const updatedMessage = await Message.findByIdAndUpdate(
                 messageId,
-                { status: "delivered" },
+                { 
+                    status: "delivered",
+                    $addToSet: { deliveredTo: to }
+                },
                 { new: true }
             );
-            if (updatedMessage && userSocketMap[to]) {
-                io.to(userSocketMap[to]).emit("messageStatusUpdate", {
+            
+            // Broadcast to receiver's room
+            if (updatedMessage && to) {
+                io.to(`user:${to}`).emit("messageStatusUpdate", {
                     messageIds: [updatedMessage._id],
                     status: "delivered",
                 });
-                
-                // Emit delivery ACK to sender
-                const senderSocketId = userSocketMap[updatedMessage.senderId.toString()];
-                if (senderSocketId) {
-                    io.to(senderSocketId).emit("messageAck", {
-                        clientMessageId: updatedMessage.clientMessageId,
-                        serverMessageId: updatedMessage._id,
-                        status: "delivered"
-                    });
-                }
             }
+            
+            // Emit delivery ACK to sender
+            io.to(`user:${updatedMessage.senderId.toString()}`).emit("messageAck", {
+                clientMessageId: updatedMessage.clientMessageId,
+                serverMessageId: updatedMessage._id,
+                status: "delivered"
+            });
         } catch (error) {
             console.log(error.message);
         }
@@ -156,48 +188,68 @@ io.on("connection", async (socket)=>{
 
     socket.on("messageRead", async ({ messageId, to }) => {
         try {
+            const message = await Message.findById(messageId);
+            if (!message) return;
+            
+            // Check if already read by this user
+            if (message.readBy && message.readBy.includes(to)) {
+                return;
+            }
+            
+            // Update to read
             const updatedMessage = await Message.findByIdAndUpdate(
                 messageId,
-                { status: "read" },
+                { 
+                    status: "read",
+                    $addToSet: { readBy: to }
+                },
                 { new: true }
             );
-            if (updatedMessage && userSocketMap[to]) {
-                io.to(userSocketMap[to]).emit("messageStatusUpdate", {
+            
+            // Broadcast to receiver (sender) about read status
+            if (updatedMessage && to) {
+                io.to(`user:${updatedMessage.senderId.toString()}`).emit("messageStatusUpdate", {
                     messageIds: [updatedMessage._id],
                     status: "read",
+                    readBy: updatedMessage.readBy
                 });
-                
-                // Emit read ACK to sender
-                const senderSocketId = userSocketMap[updatedMessage.senderId.toString()];
-                if (senderSocketId) {
-                    io.to(senderSocketId).emit("messageAck", {
-                        clientMessageId: updatedMessage.clientMessageId,
-                        serverMessageId: updatedMessage._id,
-                        status: "read"
-                    });
-                }
             }
         } catch (error) {
             console.log(error.message);
         }
     });
 
-    // Sync missed messages on reconnect
-    socket.on("syncMessages", async ({ lastMessageId, lastMessageTimestamp }) => {
+    // Sync missed messages on reconnect with pagination support
+    socket.on("syncMessages", async ({ lastMessageId, lastMessageTimestamp, limit = 50 }) => {
         try {
             const userIdStr = userId.toString();
-            const messages = await Message.find({
-                _id: { $gt: lastMessageId },
+            const query = {
                 $or: [
                     { senderId: userIdStr, receiverId: { $exists: true } },
                     { receiverId: userIdStr, senderId: { $exists: true } }
                 ]
-            }).sort({ createdAt: 1 }).limit(100);
-
+            };
+            
+            if (lastMessageTimestamp) {
+                query.createdAt = { $lt: new Date(lastMessageTimestamp) };
+            }
+            
+            const messages = await Message.find(query)
+                .sort({ createdAt: -1 })
+                .limit(limit);
+            
+            const hasMore = messages.length === limit;
+            
             if (messages.length > 0) {
                 socket.emit("syncResponse", {
-                    messages,
-                    syncTimestamp: Date.now()
+                    messages: messages.reverse(),
+                    hasMore,
+                    syncTimestamp: messages[0]?.createdAt
+                });
+            } else {
+                socket.emit("syncResponse", {
+                    messages: [],
+                    hasMore: false
                 });
             }
         } catch (error) {

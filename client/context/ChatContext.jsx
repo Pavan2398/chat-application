@@ -7,6 +7,7 @@ export const ChatContext = createContext();
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [2000, 4000, 8000];
+const JITTER_RANGE = 500; // 0-500ms random jitter to prevent retry storms
 const PENDING_MESSAGES_KEY = 'chatmate_pending_messages';
 
 export const ChatProvider = ({ children }) => {
@@ -29,6 +30,12 @@ export const ChatProvider = ({ children }) => {
 
   const generateClientMessageId = () => {
     return uuidv4();
+  };
+
+  const getRetryDelay = (retryCount) => {
+    const baseDelay = RETRY_DELAYS[Math.min(retryCount - 1, RETRY_DELAYS.length - 1)];
+    const jitter = Math.random() * JITTER_RANGE;
+    return baseDelay + jitter;
   };
 
   // Persist pending messages to localStorage
@@ -93,7 +100,7 @@ export const ChatProvider = ({ children }) => {
     pending.status = 'retrying';
     savePendingToStorage();
 
-    const delay = RETRY_DELAYS[Math.min(pending.retryCount - 1, RETRY_DELAYS.length - 1)];
+    const delay = getRetryDelay(pending.retryCount);
     
     retryTimeoutsRef.current[clientMessageId] = setTimeout(async () => {
       try {
@@ -117,6 +124,7 @@ export const ChatProvider = ({ children }) => {
   };
 
   // Reconcile pending messages after reconnect
+  // Uses server-as-source-of-truth pattern
   const reconcilePendingMessages = async () => {
     const pending = pendingMessagesRef.current;
     const clientMessageIds = Object.keys(pending);
@@ -132,9 +140,10 @@ export const ChatProvider = ({ children }) => {
         data.results.forEach(result => {
           if (result.exists) {
             removeFromPendingQueue(result.clientMessageId);
-            if (!result.isDuplicate) {
+            // Server wins: always use server state
+            if (!result.isDuplicate && result.message) {
               setMessages(prev => {
-                const exists = prev.some(m => m._id === result.serverMessageId);
+                const exists = prev.some(m => m._id === result.message._id);
                 if (exists) return prev;
                 return [...prev, result.message];
               });
@@ -241,8 +250,15 @@ export const ChatProvider = ({ children }) => {
         retryMessage(clientMessageId);
       }
     } catch (error) {
-      toast.error(error.message);
-      retryMessage(clientMessageId);
+      // Handle rate limit errors (429)
+      if (error.response?.status === 429) {
+        const retryAfter = error.response.data?.retryAfter || 5;
+        toast.warning(`Rate limit. Retrying in ${retryAfter}s...`);
+        setTimeout(() => retryMessage(clientMessageId), retryAfter * 1000);
+      } else {
+        toast.error(error.message);
+        retryMessage(clientMessageId);
+      }
     }
   };
 
@@ -331,8 +347,15 @@ export const ChatProvider = ({ children }) => {
         retryMessage(clientMessageId);
       }
     } catch (error) {
-      toast.error(error.message);
-      retryMessage(clientMessageId);
+      // Handle rate limit errors (429)
+      if (error.response?.status === 429) {
+        const retryAfter = error.response.data?.retryAfter || 5;
+        toast.warning(`Rate limit. Retrying in ${retryAfter}s...`);
+        setTimeout(() => retryMessage(clientMessageId), retryAfter * 1000);
+      } else {
+        toast.error(error.message);
+        retryMessage(clientMessageId);
+      }
     }
   };
 
@@ -473,7 +496,7 @@ export const ChatProvider = ({ children }) => {
       });
     });
 
-    socket.on("syncResponse", ({ messages: syncMessages, syncTimestamp }) => {
+    socket.on("syncResponse", ({ messages: syncMessages, hasMore, syncTimestamp }) => {
       if (!syncMessages || syncMessages.length === 0) return;
       
       setMessages((prev) => {
@@ -483,6 +506,15 @@ export const ChatProvider = ({ children }) => {
           new Date(a.createdAt) - new Date(b.createdAt)
         );
       });
+      
+      // If more messages exist, fetch next page
+      if (hasMore && syncTimestamp) {
+        setTimeout(() => {
+          socket.emit("syncMessages", {
+            lastMessageTimestamp: syncTimestamp
+          });
+        }, 100);
+      }
     });
   };
 
@@ -565,6 +597,7 @@ export const ChatProvider = ({ children }) => {
     messages,
     users,
     groups,
+    setGroups,
     selectedUser,
     chatType,
     setChatType,

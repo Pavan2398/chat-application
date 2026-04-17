@@ -163,17 +163,39 @@ export const AuthProvider = ({ children  })=>{
 
         newSocket.on("disconnect", (reason) => {
             console.log("Socket disconnected:", reason);
+            
+            // If server disconnected (e.g., token expiry), reconnect
+            if (reason === "io server disconnect") {
+                handleTokenExpiry().then(() => {
+                    if (authUser) {
+                        connectSocket(authUser, true);
+                    }
+                });
+            }
         });
 
         newSocket.on("connect_error", (error) => {
             console.error("Socket connection error:", error.message);
+            
+            // Handle token expiry - refresh and reconnect
+            if (error.message === "TOKEN_EXPIRED" || error.message.includes("expired")) {
+                handleTokenExpiry().then(() => {
+                    // After token refresh, reconnect with new token
+                    const newToken = localStorage.getItem("token");
+                    if (newToken) {
+                        newSocket.auth.token = newToken;
+                        newSocket.connect();
+                    }
+                });
+            }
         });
 
         newSocket.on("getOnlineUsers", (userIds)=>{
-            setOnlineUsers(userIds);
+            setOnlineUsers(userIds || []);
         });
 
         newSocket.on("userStatusUpdate", ({ userId, status, lastSeen: userLastSeen }) => {
+            console.log("User status update:", userId, status, userLastSeen);
             if (status === "online") {
                 setOnlineUsers(prev => {
                     if (!prev.includes(userId)) {
@@ -181,9 +203,25 @@ export const AuthProvider = ({ children  })=>{
                     }
                     return prev;
                 });
-            } else if (status === "offline" && userLastSeen) {
-                setLastSeen(prev => ({ ...prev, [userId]: userLastSeen }));
+                // Also remove from lastSeen since they're now online
+                setLastSeen(prev => {
+                    const newLastSeen = { ...prev };
+                    delete newLastSeen[userId];
+                    return newLastSeen;
+                });
+            } else if (status === "offline") {
                 setOnlineUsers(prev => prev.filter(id => id !== userId));
+                if (userLastSeen) {
+                    setLastSeen(prev => ({ ...prev, [userId]: userLastSeen }));
+                }
+            }
+        });
+
+        // Also listen for user going offline specifically
+        newSocket.on("userOffline", ({ userId, lastSeen: userLastSeen }) => {
+            setOnlineUsers(prev => prev.filter(id => id !== userId));
+            if (userLastSeen) {
+                setLastSeen(prev => ({ ...prev, [userId]: userLastSeen }));
             }
         });
 
