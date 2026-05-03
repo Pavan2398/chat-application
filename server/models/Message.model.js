@@ -43,7 +43,6 @@ const messageSchema = new Schema({
     },
     clientMessageId: {
         type: String,
-        sparse: true
     },
     readBy: [{
         type: mongoose.Schema.Types.ObjectId,
