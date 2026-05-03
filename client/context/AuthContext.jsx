@@ -5,7 +5,7 @@ import { io } from "socket.io-client"
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 
-const backendUrl = import.meta.env.VITE_BACKEND_URL;
+const backendUrl = import.meta.env.VITE_BACKEND_URL?.trim();
 axios.defaults.baseURL = backendUrl;
 
 export const AuthContext = createContext();
@@ -33,7 +33,7 @@ export const AuthProvider = ({ children  })=>{
                 if (data.user.lastSeen) {
                     setLastSeen(data.user.lastSeen);
                 }
-                connectSocket(data.user)
+                connectSocket(data.user, false, localStorage.getItem("token"))
             }
         } catch (error) {
             if (error.response?.status === 401) {
@@ -75,11 +75,14 @@ export const AuthProvider = ({ children  })=>{
         try {
             const { data } = await axios.post(`/api/auth/${state}`, credentials);
             if(data.success){
-                setAuthUser(data.userData);
-                connectSocket(data.userData);
+                // Save token FIRST before connecting socket
+                localStorage.setItem("token", data.token);
                 axios.defaults.headers.common["token"] = data.token;
                 setToken(data.token);
-                localStorage.setItem("token", data.token)
+                setAuthUser(data.userData);
+                
+                // Pass token directly to avoid race condition with localStorage
+                connectSocket(data.userData, false, data.token);
                 toast.success(data.message)
             }else{
                 toast.error(data.message)
@@ -101,7 +104,7 @@ export const AuthProvider = ({ children  })=>{
         setOnlineUsers([]);
         axios.defaults.headers.common["token"] = null;
         toast.success("Logged out successfully")
-        socket.disconnect();
+        socket?.disconnect();
     }
 
     // update profile function to handle user profile updates
@@ -121,7 +124,7 @@ export const AuthProvider = ({ children  })=>{
     }
 
     // connect socket function to handle socket connection and online users updates
-    const connectSocket = (userData, forceReconnect = false)=>{
+    const connectSocket = (userData, forceReconnect = false, tokenOverride = null)=>{
         if(!userData) return;
         
         if (socket?.connected && !forceReconnect) return;
@@ -130,12 +133,18 @@ export const AuthProvider = ({ children  })=>{
             socket.disconnect();
         }
 
-        const token = localStorage.getItem("token");
+        const connectionToken = tokenOverride || localStorage.getItem("token");
+        
+        if (!connectionToken) {
+            console.error("Cannot connect socket: No token found");
+            return;
+        }
         
         const newSocket = io(backendUrl, {
-            auth: { token },
+            auth: { token: connectionToken },
             query: {
                 userId: userData._id,
+                token: connectionToken // Fallback for some polling scenarios
             },
             reconnection: true,
             reconnectionAttempts: maxReconnectAttempts,
@@ -167,8 +176,9 @@ export const AuthProvider = ({ children  })=>{
             // If server disconnected (e.g., token expiry), reconnect
             if (reason === "io server disconnect") {
                 handleTokenExpiry().then(() => {
-                    if (authUser) {
-                        connectSocket(authUser, true);
+                    const latestToken = localStorage.getItem("token");
+                    if (authUser && latestToken) {
+                        connectSocket(authUser, true, latestToken);
                     }
                 });
             }
@@ -178,12 +188,13 @@ export const AuthProvider = ({ children  })=>{
             console.error("Socket connection error:", error.message);
             
             // Handle token expiry - refresh and reconnect
-            if (error.message === "TOKEN_EXPIRED" || error.message.includes("expired")) {
+            if (error.message === "TOKEN_EXPIRED" || error.message.includes("expired") || error.message === "Authentication required") {
                 handleTokenExpiry().then(() => {
                     // After token refresh, reconnect with new token
                     const newToken = localStorage.getItem("token");
                     if (newToken) {
                         newSocket.auth.token = newToken;
+                        if (newSocket.query) newSocket.query.token = newToken;
                         newSocket.connect();
                     }
                 });
